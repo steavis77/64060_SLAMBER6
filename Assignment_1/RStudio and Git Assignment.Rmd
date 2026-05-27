@@ -1,0 +1,112 @@
+---
+title: "Assignment 1: R and Git Setup"
+author: "Steve Lamber"
+date: "`5/26/2026"
+output: html_document
+---
+
+## Introduction
+
+The purpose of this assignment is to demonstrate that R, RStudio, and GitHub are set up and can be used for basic data analysis. For this assignment, I used the Palmer Penguins dataset. This dataset includes both quantitative variables, such as body mass, bill length, bill depth, and flipper length, and categorical variables, such as species, island, and sex.
+
+The dataset was downloaded from the following web source:
+
+https://raw.githubusercontent.com/allisonhorst/palmerpenguins/main/inst/extdata/penguins.csv
+
+## Import the Dataset
+
+```{r import-data}
+source_url <- "https://raw.githubusercontent.com/allisonhorst/palmerpenguins/main/inst/extdata/penguins.csv"
+
+penguins <- read.csv(source_url)
+
+head(penguins)
+```
+
+The dataset has been imported into R. The first few rows are displayed above to confirm that the data loaded correctly.
+
+## Review the Structure of the Dataset
+
+```{r data-structure}
+str(penguins)
+```
+
+The structure output shows the variables included in the dataset and their data types. The dataset contains a mix of categorical and quantitative variables, which makes it a useful dataset for practicing basic data analysis in R.
+
+## Descriptive Statistics for Quantitative Variables
+
+```{r quantitative-summary}
+quantitative_variables <- penguins[, c("bill_length_mm", 
+                                       "bill_depth_mm", 
+                                       "flipper_length_mm", 
+                                       "body_mass_g")]
+
+summary(quantitative_variables)
+```
+
+The summary above provides descriptive statistics for selected quantitative variables. These statistics include the minimum, maximum, mean, median, and quartile values for bill length, bill depth, flipper length, and body mass.
+
+## Descriptive Statistics for Categorical Variables
+
+```{r species-summary}
+table(penguins$species)
+```
+
+```{r island-summary}
+table(penguins$island)
+```
+
+```{r sex-summary}
+table(penguins$sex, useNA = "ifany")
+```
+
+The tables above summarize selected categorical variables. They show how many observations appear in each category for species, island, and sex.
+
+## Transform One Variable
+
+For the transformation step, I converted body mass from grams to kilograms. This creates a new variable called body_mass_kg.
+
+```{r transform-variable}
+penguins$body_mass_kg <- penguins$body_mass_g / 1000
+
+head(penguins[, c("species", "body_mass_g", "body_mass_kg")])
+```
+
+This transformation makes body mass easier to interpret because kilograms are a more familiar unit than grams for larger body weight values.
+
+## Plot One Quantitative Variable
+
+```{r histogram-body-mass}
+hist(na.omit(penguins$body_mass_kg),
+     main = "Distribution of Penguin Body Mass",
+     xlab = "Body Mass (kg)",
+     ylab = "Count")
+```
+
+The histogram above shows the distribution of penguin body mass in kilograms. This helps visualize the spread of body mass values across the observations in the dataset.
+
+## Create a Scatterplot
+
+```{r scatterplot-flipper-bodymass}
+species_factor <- as.factor(penguins$species)
+species_colors <- as.numeric(species_factor)
+
+plot(penguins$flipper_length_mm,
+     penguins$body_mass_kg,
+     main = "Penguin Body Mass by Flipper Length",
+     xlab = "Flipper Length (mm)",
+     ylab = "Body Mass (kg)",
+     col = species_colors,
+     pch = 19)
+
+legend("topleft",
+       legend = levels(species_factor),
+       col = 1:length(levels(species_factor)),
+       pch = 19)
+```
+
+The scatterplot shows the relationship between flipper length and body mass. In general, penguins with longer flippers appear to have higher body mass. Coloring the points by species also makes it easier to compare the different penguin species.
+
+## Conclusion
+
+This assignment demonstrated how to import a dataset from the web into R, review the structure of the data, calculate descriptive statistics for quantitative and categorical variables, transform a variable, and create basic visualizations. The Palmer Penguins dataset was useful for this assignment because it includes both numeric and categorical data.
