@@ -1,0 +1,292 @@
+---
+title: 'Assignment 3: Naive Bayes Classification'
+author: "Steve Lamber"
+date: "`r Sys.Date()`"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+## Introduction
+
+The purpose of this assignment is to use Naive Bayes classification to estimate whether a Universal Bank customer will accept a personal loan offer. The dataset contains 5,000 customers, including demographic information, banking relationship information, and customer response to a previous personal loan campaign.
+
+For this assignment, the focus is on three variables: Online, CreditCard, and Personal Loan. Online indicates whether the customer is an active user of online banking services. CreditCard indicates whether the customer holds a credit card issued by the bank. Personal Loan is the outcome variable, where 1 means the customer accepted the personal loan offer and 0 means the customer did not accept it.
+
+## Load Packages and Data
+
+```{r setup, message=FALSE, warning=FALSE}
+# Run these once if needed:
+# install.packages(c("caret", "e1071", "knitr"))
+
+library(caret)
+library(e1071)
+library(knitr)
+
+bank <- read.csv("UniversalBank.csv")
+names(bank) <- make.names(names(bank))
+
+head(bank)
+str(bank)
+```
+
+## Prepare Variables
+
+For this assignment, I use Online, CreditCard, and Personal Loan. I convert them to factors because Naive Bayes works naturally with categorical predictors.
+
+```{r prepare-variables}
+bank_nb <- bank[, c("Online", "CreditCard", "Personal.Loan")]
+
+bank_nb$Online <- factor(bank_nb$Online, levels = c(0, 1))
+bank_nb$CreditCard <- factor(bank_nb$CreditCard, levels = c(0, 1))
+bank_nb$Personal.Loan <- factor(bank_nb$Personal.Loan, levels = c(0, 1))
+
+summary(bank_nb)
+```
+
+## Partition the Data
+
+The data is partitioned into 60% training and 40% validation. I use stratified partitioning so that the proportion of loan acceptors and non-acceptors is similar in both datasets.
+
+```{r partition-data}
+set.seed(123)
+
+train_index <- createDataPartition(bank_nb$Personal.Loan, p = 0.60, list = FALSE)
+
+train_data <- bank_nb[train_index, ]
+validation_data <- bank_nb[-train_index, ]
+
+nrow(train_data)
+nrow(validation_data)
+
+table(train_data$Personal.Loan)
+table(validation_data$Personal.Loan)
+```
+
+## A. Pivot Table for Online, Credit Card, and Loan
+
+The pivot table below uses CreditCard as the row variable, Personal Loan as the secondary row variable, and Online as the column variable. The values in the table are counts from the training data.
+
+```{r pivot-table-a}
+pivot_a <- ftable(
+  CC = train_data$CreditCard,
+  Loan = train_data$Personal.Loan,
+  Online = train_data$Online
+)
+
+pivot_a
+```
+
+## B. Probability of Loan Acceptance Given Credit Card and Online Banking
+
+The customer owns a bank credit card and actively uses online banking services. This means CreditCard = 1 and Online = 1. Using the pivot table, the probability of loan acceptance is calculated directly as:
+
+P(Loan = 1 | CC = 1, Online = 1)
+
+```{r probability-from-pivot}
+count_loan1_cc1_online1 <- sum(
+  train_data$Personal.Loan == "1" &
+    train_data$CreditCard == "1" &
+    train_data$Online == "1"
+)
+
+count_all_cc1_online1 <- sum(
+  train_data$CreditCard == "1" &
+    train_data$Online == "1"
+)
+
+prob_pivot <- count_loan1_cc1_online1 / count_all_cc1_online1
+
+count_loan1_cc1_online1
+count_all_cc1_online1
+prob_pivot
+```
+
+Based on the training data pivot table, the probability that a customer accepts the loan offer given that they have a bank credit card and actively use online banking is `r round(prob_pivot, 4)`.
+
+## C. Separate Pivot Tables
+
+The first table shows Loan as a function of Online. The second table shows Loan as a function of CreditCard.
+
+```{r pivot-online}
+pivot_online <- table(
+  Loan = train_data$Personal.Loan,
+  Online = train_data$Online
+)
+
+pivot_online
+```
+
+```{r pivot-creditcard}
+pivot_cc <- table(
+  Loan = train_data$Personal.Loan,
+  CC = train_data$CreditCard
+)
+
+pivot_cc
+```
+
+## D. Conditional Probabilities
+
+The following quantities are calculated from the training data.
+
+```{r conditional-probabilities}
+p_cc1_given_loan1 <- sum(train_data$CreditCard == "1" & train_data$Personal.Loan == "1") /
+  sum(train_data$Personal.Loan == "1")
+
+p_online1_given_loan1 <- sum(train_data$Online == "1" & train_data$Personal.Loan == "1") /
+  sum(train_data$Personal.Loan == "1")
+
+p_loan1 <- mean(train_data$Personal.Loan == "1")
+
+p_cc1_given_loan0 <- sum(train_data$CreditCard == "1" & train_data$Personal.Loan == "0") /
+  sum(train_data$Personal.Loan == "0")
+
+p_online1_given_loan0 <- sum(train_data$Online == "1" & train_data$Personal.Loan == "0") /
+  sum(train_data$Personal.Loan == "0")
+
+p_loan0 <- mean(train_data$Personal.Loan == "0")
+
+conditional_probabilities <- data.frame(
+  Quantity = c(
+    "P(CC = 1 | Loan = 1)",
+    "P(Online = 1 | Loan = 1)",
+    "P(Loan = 1)",
+    "P(CC = 1 | Loan = 0)",
+    "P(Online = 1 | Loan = 0)",
+    "P(Loan = 0)"
+  ),
+  Value = c(
+    p_cc1_given_loan1,
+    p_online1_given_loan1,
+    p_loan1,
+    p_cc1_given_loan0,
+    p_online1_given_loan0,
+    p_loan0
+  )
+)
+
+kable(conditional_probabilities, digits = 4)
+```
+
+## E. Naive Bayes Probability Calculation
+
+The Naive Bayes calculation assumes that CreditCard and Online are conditionally independent given the loan outcome. The numerator for Loan = 1 is:
+
+P(CC = 1 | Loan = 1) x P(Online = 1 | Loan = 1) x P(Loan = 1)
+
+The numerator for Loan = 0 is:
+
+P(CC = 1 | Loan = 0) x P(Online = 1 | Loan = 0) x P(Loan = 0)
+
+The final Naive Bayes probability is the Loan = 1 numerator divided by the sum of the Loan = 1 and Loan = 0 numerators.
+
+```{r naive-bayes-manual}
+nb_numerator_loan1 <- p_cc1_given_loan1 * p_online1_given_loan1 * p_loan1
+nb_numerator_loan0 <- p_cc1_given_loan0 * p_online1_given_loan0 * p_loan0
+
+prob_nb_manual <- nb_numerator_loan1 / (nb_numerator_loan1 + nb_numerator_loan0)
+
+nb_calculation <- data.frame(
+  Quantity = c(
+    "Loan = 1 numerator",
+    "Loan = 0 numerator",
+    "Naive Bayes P(Loan = 1 | CC = 1, Online = 1)"
+  ),
+  Value = c(
+    nb_numerator_loan1,
+    nb_numerator_loan0,
+    prob_nb_manual
+  )
+)
+
+kable(nb_calculation, digits = 6)
+```
+
+Using the Naive Bayes calculation, P(Loan = 1 | CC = 1, Online = 1) is `r round(prob_nb_manual, 4)`.
+
+## F. Comparison with the Pivot Table Estimate
+
+The direct pivot table estimate was `r round(prob_pivot, 4)`, while the Naive Bayes estimate was `r round(prob_nb_manual, 4)`.
+
+The pivot table estimate is the more direct estimate for this specific combination of predictors because it uses the actual observed proportion of loan acceptors among customers with CreditCard = 1 and Online = 1. The Naive Bayes estimate is based on the assumption that CreditCard and Online are conditionally independent given the loan outcome. That assumption may not be perfectly true in real business data. However, Naive Bayes can be useful when there are many predictors or when exact predictor combinations become too sparse to estimate directly.
+
+## G. Naive Bayes Model Output
+
+To compute P(Loan = 1 | CC = 1, Online = 1), the model needs the class priors and the conditional probabilities for the relevant predictor values. Specifically, it needs:
+
+P(Loan = 1), P(CC = 1 | Loan = 1), and P(Online = 1 | Loan = 1)
+
+It also needs the corresponding values for Loan = 0 so that the posterior probability can be normalized:
+
+P(Loan = 0), P(CC = 1 | Loan = 0), and P(Online = 1 | Loan = 0)
+
+The Naive Bayes model below is run using the training data.
+
+```{r naive-bayes-model}
+nb_model <- naiveBayes(
+  Personal.Loan ~ Online + CreditCard,
+  data = train_data,
+  laplace = 0
+)
+
+nb_model
+```
+
+The model can return raw posterior probabilities using type = "raw". The record below represents a customer with Online = 1 and CreditCard = 1.
+
+```{r naive-bayes-prediction-new}
+new_customer <- data.frame(
+  Online = factor(1, levels = c(0, 1)),
+  CreditCard = factor(1, levels = c(0, 1))
+)
+
+nb_raw_new <- predict(nb_model, new_customer, type = "raw")
+nb_raw_new
+
+model_probability <- nb_raw_new[1, "1"]
+model_probability
+```
+
+The Naive Bayes model output gives P(Loan = 1 | CC = 1, Online = 1) as `r round(model_probability, 4)`. This should match, or be extremely close to, the manual Naive Bayes calculation from part E because both are based on the same prior and conditional probability values.
+
+The same probability can also be found by examining the raw predicted probabilities for training records with Online = 1 and CreditCard = 1.
+
+```{r raw-training-probabilities}
+training_raw_probs <- predict(
+  nb_model,
+  train_data[, c("Online", "CreditCard")],
+  type = "raw"
+)
+
+unique_prob_for_cc1_online1 <- unique(
+  training_raw_probs[
+    train_data$Online == "1" & train_data$CreditCard == "1",
+    "1"
+  ]
+)
+
+unique_prob_for_cc1_online1
+```
+
+## Validation Performance
+
+Although the main focus of this assignment is the probability calculation, the validation data can also be used to evaluate the model's classification performance.
+
+```{r validation-performance}
+validation_pred <- predict(nb_model, validation_data[, c("Online", "CreditCard")])
+
+validation_cm <- confusionMatrix(
+  data = validation_pred,
+  reference = validation_data$Personal.Loan,
+  positive = "1"
+)
+
+validation_cm
+```
+
+## Conclusion
+
+This assignment used Naive Bayes to estimate the probability that a Universal Bank customer would accept a personal loan offer based on whether the customer has a bank credit card and actively uses online banking. The direct pivot table estimate and the Naive Bayes estimate are different because the pivot table uses the observed joint counts directly, while Naive Bayes multiplies separate conditional probabilities under the conditional independence assumption.
+
+The direct pivot table estimate is more accurate for this specific two-predictor case when there are enough observations in the relevant cell. Naive Bayes becomes more useful when there are more predictors and the exact combinations of predictor values are too sparse to estimate directly.
