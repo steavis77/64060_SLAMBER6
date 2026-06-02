@@ -1,0 +1,349 @@
+---
+output:
+  pdf_document: default
+  html_document: default
+---
+---
+
+title: "Assignment 2: k-NN Classification"
+author: "Steve Lamber"
+date: "6-2-2026"
+output: html_document
+---------------------
+
+## Introduction
+
+The purpose of this assignment is to use k-nearest neighbors classification to predict whether a Universal Bank customer will accept a personal loan offer. The bank wants to improve its marketing efforts by identifying liability customers who are more likely to become personal loan customers.
+
+The dataset contains 5,000 customer records, including demographic information, banking relationship information, and whether the customer accepted a personal loan offer in a previous campaign. The target variable is Personal Loan, where 1 means the customer accepted the loan offer and 0 means the customer did not accept the loan offer.
+
+## Load Packages and Data
+
+```{r setup, message=FALSE, warning=FALSE}
+# Run this once if needed:
+# install.packages(c("caret", "class", "knitr"))
+
+library(caret)
+library(class)
+library(knitr)
+
+bank <- read.csv("UniversalBank.csv")
+
+names(bank) <- make.names(names(bank))
+
+head(bank)
+str(bank)
+```
+
+## Data Preparation
+
+The ID and ZIP code fields are removed because they are identifiers rather than useful predictors. The Education variable has more than two categories, so it is converted into dummy variables.
+
+```{r data-prep}
+bank$Education <- factor(bank$Education)
+
+education_dummies <- model.matrix(~ Education - 1, data = bank)
+colnames(education_dummies) <- c("Education_1", "Education_2", "Education_3")
+
+bank_model <- cbind(
+  bank[, !(names(bank) %in% c("ID", "ZIP.Code", "Education"))],
+  education_dummies
+)
+
+bank_model$Personal.Loan <- factor(bank_model$Personal.Loan, levels = c(0, 1))
+
+head(bank_model)
+summary(bank_model$Personal.Loan)
+```
+
+## 1. Partition Data into Training and Validation Sets
+
+The data is partitioned into 60% training and 40% validation. The training set is used to build the k-NN model, while the validation set is used to evaluate model performance.
+
+```{r train-validation-split}
+set.seed(123)
+
+train_index <- createDataPartition(bank_model$Personal.Loan, p = 0.60, list = FALSE)
+
+train_data <- bank_model[train_index, ]
+validation_data <- bank_model[-train_index, ]
+
+predictors <- setdiff(names(bank_model), "Personal.Loan")
+
+train_x <- train_data[, predictors]
+validation_x <- validation_data[, predictors]
+
+train_y <- train_data$Personal.Loan
+validation_y <- validation_data$Personal.Loan
+
+table(train_y)
+table(validation_y)
+```
+
+## Normalize the Predictor Variables
+
+Since k-NN depends on distance calculations, predictor variables need to be normalized. This prevents variables with larger numeric ranges from dominating the distance calculation.
+
+```{r normalize-data}
+normalization_model <- preProcess(train_x, method = "range")
+
+train_x_norm <- predict(normalization_model, train_x)
+validation_x_norm <- predict(normalization_model, validation_x)
+
+summary(train_x_norm)
+```
+
+## New Customer Record
+
+The following customer is classified using k-NN:
+
+Age = 40, Experience = 10, Income = 84, Family = 2, CCAvg = 2, Education_1 = 0, Education_2 = 1, Education_3 = 0, Mortgage = 0, Securities Account = 0, CD Account = 0, Online = 1, and Credit Card = 1.
+
+```{r new-customer}
+new_customer <- data.frame(
+  Age = 40,
+  Experience = 10,
+  Income = 84,
+  Family = 2,
+  CCAvg = 2,
+  Mortgage = 0,
+  Securities.Account = 0,
+  CD.Account = 0,
+  Online = 1,
+  CreditCard = 1,
+  Education_1 = 0,
+  Education_2 = 1,
+  Education_3 = 0
+)
+
+new_customer <- new_customer[, predictors]
+
+new_customer_norm <- predict(normalization_model, new_customer)
+new_customer_norm
+```
+
+## k-NN Classification with k = 1
+
+```{r knn-k1}
+pred_new_k1 <- knn(
+  train = train_x_norm,
+  test = new_customer_norm,
+  cl = train_y,
+  k = 1,
+  prob = TRUE
+)
+
+pred_new_k1
+```
+
+Using k = 1, the new customer is classified as class `r as.character(pred_new_k1)`. Since class 1 represents loan acceptance and class 0 represents non-acceptance, this means the customer is predicted as `r ifelse(as.character(pred_new_k1) == "1", "likely to accept the loan offer", "not likely to accept the loan offer")`.
+
+## 2. Choosing a Value of k
+
+The value of k controls how many nearest neighbors are used to classify a new observation. A small value of k can overfit by following noise in the training data too closely. A large value of k can smooth too much and ignore useful local patterns in the predictor variables.
+
+To choose k, I tested odd values of k from 1 through 25 and selected the value with the best validation accuracy.
+
+```{r tune-k}
+k_values <- seq(1, 25, by = 2)
+
+tuning_results <- data.frame(
+  k = integer(),
+  Accuracy = numeric(),
+  Sensitivity = numeric(),
+  Specificity = numeric()
+)
+
+for (k in k_values) {
+  validation_pred <- knn(
+    train = train_x_norm,
+    test = validation_x_norm,
+    cl = train_y,
+    k = k
+  )
+  
+  cm <- confusionMatrix(
+    data = validation_pred,
+    reference = validation_y,
+    positive = "1"
+  )
+  
+  tuning_results <- rbind(
+    tuning_results,
+    data.frame(
+      k = k,
+      Accuracy = as.numeric(cm$overall["Accuracy"]),
+      Sensitivity = as.numeric(cm$byClass["Sensitivity"]),
+      Specificity = as.numeric(cm$byClass["Specificity"])
+    )
+  )
+}
+
+kable(tuning_results, digits = 4)
+```
+
+```{r plot-k}
+plot(
+  tuning_results$k,
+  tuning_results$Accuracy,
+  type = "b",
+  xlab = "k",
+  ylab = "Validation Accuracy",
+  main = "Validation Accuracy by k"
+)
+```
+
+```{r choose-best-k}
+best_k <- tuning_results$k[which.max(tuning_results$Accuracy)]
+
+best_k
+```
+
+Based on the validation results, the selected value of k is `r best_k`. This value provides the best validation accuracy among the tested odd k values and is used for the remaining parts of the assignment.
+
+## 3. Confusion Matrix for Validation Data Using the Best k
+
+```{r validation-confusion-matrix}
+validation_pred_best <- knn(
+  train = train_x_norm,
+  test = validation_x_norm,
+  cl = train_y,
+  k = best_k
+)
+
+validation_cm <- confusionMatrix(
+  data = validation_pred_best,
+  reference = validation_y,
+  positive = "1"
+)
+
+validation_cm
+```
+
+The confusion matrix above shows how well the k-NN model performed on the validation data using the selected value of k. The matrix compares the predicted loan acceptance results against the actual loan acceptance results.
+
+## 4. Classify the New Customer Using the Best k
+
+```{r classify-new-customer-best-k}
+pred_new_best_k <- knn(
+  train = train_x_norm,
+  test = new_customer_norm,
+  cl = train_y,
+  k = best_k,
+  prob = TRUE
+)
+
+pred_new_best_k
+```
+
+Using the selected value of k, the new customer is classified as class `r as.character(pred_new_best_k)`. Since class 1 represents loan acceptance and class 0 represents non-acceptance, this means the customer is predicted as `r ifelse(as.character(pred_new_best_k) == "1", "likely to accept the loan offer", "not likely to accept the loan offer")`.
+
+## 5. Repartition Data into Training, Validation, and Test Sets
+
+The data is repartitioned into 50% training, 30% validation, and 20% test. The same selected value of k is then applied to the new split.
+
+```{r train-validation-test-split}
+set.seed(123)
+
+train2_index <- createDataPartition(bank_model$Personal.Loan, p = 0.50, list = FALSE)
+
+train2_data <- bank_model[train2_index, ]
+remaining_data <- bank_model[-train2_index, ]
+
+validation2_index <- createDataPartition(remaining_data$Personal.Loan, p = 0.60, list = FALSE)
+
+validation2_data <- remaining_data[validation2_index, ]
+test2_data <- remaining_data[-validation2_index, ]
+
+train2_x <- train2_data[, predictors]
+validation2_x <- validation2_data[, predictors]
+test2_x <- test2_data[, predictors]
+
+train2_y <- train2_data$Personal.Loan
+validation2_y <- validation2_data$Personal.Loan
+test2_y <- test2_data$Personal.Loan
+
+table(train2_y)
+table(validation2_y)
+table(test2_y)
+```
+
+## Normalize the New Partitions
+
+The normalization model is fit only on the training data and then applied to the validation and test sets. This avoids using information from the validation or test sets during preprocessing.
+
+```{r normalize-new-partitions}
+normalization_model2 <- preProcess(train2_x, method = "range")
+
+train2_x_norm <- predict(normalization_model2, train2_x)
+validation2_x_norm <- predict(normalization_model2, validation2_x)
+test2_x_norm <- predict(normalization_model2, test2_x)
+```
+
+## Confusion Matrices for Training, Validation, and Test Sets
+
+```{r train-validation-test-confusion-matrices}
+train2_pred <- knn(
+  train = train2_x_norm,
+  test = train2_x_norm,
+  cl = train2_y,
+  k = best_k
+)
+
+validation2_pred <- knn(
+  train = train2_x_norm,
+  test = validation2_x_norm,
+  cl = train2_y,
+  k = best_k
+)
+
+test2_pred <- knn(
+  train = train2_x_norm,
+  test = test2_x_norm,
+  cl = train2_y,
+  k = best_k
+)
+
+train2_cm <- confusionMatrix(train2_pred, train2_y, positive = "1")
+validation2_cm <- confusionMatrix(validation2_pred, validation2_y, positive = "1")
+test2_cm <- confusionMatrix(test2_pred, test2_y, positive = "1")
+
+train2_cm
+validation2_cm
+test2_cm
+```
+
+## Comparison of Model Performance
+
+```{r performance-comparison}
+comparison <- data.frame(
+  Data_Set = c("Training", "Validation", "Test"),
+  Accuracy = c(
+    as.numeric(train2_cm$overall["Accuracy"]),
+    as.numeric(validation2_cm$overall["Accuracy"]),
+    as.numeric(test2_cm$overall["Accuracy"])
+  ),
+  Sensitivity = c(
+    as.numeric(train2_cm$byClass["Sensitivity"]),
+    as.numeric(validation2_cm$byClass["Sensitivity"]),
+    as.numeric(test2_cm$byClass["Sensitivity"])
+  ),
+  Specificity = c(
+    as.numeric(train2_cm$byClass["Specificity"]),
+    as.numeric(validation2_cm$byClass["Specificity"]),
+    as.numeric(test2_cm$byClass["Specificity"])
+  )
+)
+
+kable(comparison, digits = 4)
+```
+
+The training set performance is expected to be stronger because the model is being evaluated using records from the same set used to define the neighbors. This can make training performance somewhat optimistic. The validation and test sets provide a better estimate of how the model performs on unseen data.
+
+The validation and test confusion matrices may differ because they contain different customer records. Even when the data is split in a balanced way, each partition is still only a sample of the full dataset. The test set is especially important because it is held out from model selection and gives the most honest estimate of final model performance. If the validation and test results are reasonably close, that suggests the model is generalizing consistently. If the training results are much stronger than the validation and test results, that may indicate overfitting.
+
+## Conclusion
+
+The k-NN model was used to classify whether Universal Bank customers are likely to accept a personal loan offer. The data was prepared by removing identifier fields, creating dummy variables for Education, normalizing the predictors, and partitioning the data into training, validation, and test sets. The value of k was selected by comparing validation performance across multiple odd k values.
+
+The selected k was then used to classify the provided new customer and to evaluate model performance with confusion matrices. Overall, the assignment shows how k-NN can be used for classification and how validation and test data help evaluate whether the model is likely to perform well on new customers.
