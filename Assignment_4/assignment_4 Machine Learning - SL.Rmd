@@ -1,0 +1,243 @@
+---
+title: "Assignment 4: k-Means Clustering"
+author: "Steve Lamber"
+date: "`r Sys.Date()`"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+## Introduction
+
+The purpose of this assignment is to use k-means clustering to explore the structure of the pharmaceutical industry using financial measures. The dataset contains 21 pharmaceutical firms and includes financial variables such as market capitalization, beta, price/earnings ratio, return on equity, return on assets, asset turnover, leverage, revenue growth, and net profit margin. It also includes variables not used in the clustering process, such as median recommendation, headquarters location, and stock exchange.
+
+For the clustering model, I used only the first nine numerical variables listed in the assignment instructions. The remaining variables were used after the clusters were created to help interpret whether there were any patterns by recommendation, location, or exchange.
+
+## Load the Data
+
+```{r load-data}
+pharma <- read.csv("Pharmaceuticals.csv")
+
+str(pharma)
+head(pharma)
+```
+
+## Select Numerical Variables for Clustering
+
+The assignment asks us to cluster the firms using only the numerical financial variables 1 through 9. These are market capitalization, beta, price/earnings ratio, return on equity, return on assets, asset turnover, leverage, estimated revenue growth, and net profit margin.
+
+```{r select-numeric-variables}
+numeric_vars <- c(
+  "Market_Cap",
+  "Beta",
+  "PE_Ratio",
+  "ROE",
+  "ROA",
+  "Asset_Turnover",
+  "Leverage",
+  "Rev_Growth",
+  "Net_Profit_Margin"
+)
+
+pharma_numeric <- pharma[, numeric_vars]
+
+summary(pharma_numeric)
+```
+
+## Standardize the Numerical Variables
+
+The numerical variables are measured on very different scales. For example, market capitalization is measured in billions of dollars, while beta and leverage are much smaller values. Since k-means uses distance calculations, variables with larger scales can dominate the clustering if the data is not standardized.
+
+For that reason, I standardized all nine numerical variables using z-score standardization. I did not apply additional manual weights to the variables. This gives each financial measure an equal opportunity to influence the clustering result.
+
+```{r standardize-data}
+pharma_scaled <- scale(pharma_numeric)
+
+summary(pharma_scaled)
+```
+
+## Choosing the Number of Clusters
+
+The main tuning choice in k-means is the number of clusters, k. I evaluated possible values of k using the elbow method and the average silhouette method.
+
+The elbow method looks at the total within-cluster sum of squares. As k increases, within-cluster variation should decrease, but the goal is to choose a value where additional clusters provide a smaller improvement.
+
+```{r elbow-method}
+set.seed(123)
+
+wss <- numeric(8)
+
+for (k in 1:8) {
+  kmeans_model <- kmeans(pharma_scaled, centers = k, nstart = 50)
+  wss[k] <- kmeans_model$tot.withinss
+}
+
+plot(
+  1:8,
+  wss,
+  type = "b",
+  xlab = "Number of Clusters (k)",
+  ylab = "Total Within-Cluster Sum of Squares",
+  main = "Elbow Method for Selecting k"
+)
+
+wss_table <- data.frame(
+  k = 1:8,
+  WSS = round(wss, 3)
+)
+
+knitr::kable(wss_table)
+```
+
+The silhouette method measures how well each observation fits within its assigned cluster compared with other clusters. Higher average silhouette values suggest a better clustering structure.
+
+```{r silhouette-method}
+library(cluster)
+
+silhouette_values <- numeric(7)
+
+for (k in 2:8) {
+  kmeans_model <- kmeans(pharma_scaled, centers = k, nstart = 50)
+  silhouette_result <- silhouette(kmeans_model$cluster, dist(pharma_scaled))
+  silhouette_values[k - 1] <- mean(silhouette_result[, 3])
+}
+
+plot(
+  2:8,
+  silhouette_values,
+  type = "b",
+  xlab = "Number of Clusters (k)",
+  ylab = "Average Silhouette Width",
+  main = "Average Silhouette Method for Selecting k"
+)
+
+silhouette_table <- data.frame(
+  k = 2:8,
+  Average_Silhouette = round(silhouette_values, 3)
+)
+
+knitr::kable(silhouette_table)
+```
+
+Based on the elbow and silhouette results, I selected k = 3. This choice provides an interpretable number of clusters for a small dataset of only 21 firms. A larger number of clusters would create very small groups, which may be harder to interpret and may overfit the specific sample.
+
+## Run the k-Means Model
+
+I used k-means clustering with k = 3. Because k-means can produce different results depending on its random starting points, I set a random seed and used 50 random starts.
+
+```{r final-kmeans}
+set.seed(123)
+
+final_k <- 3
+
+kmeans_final <- kmeans(pharma_scaled, centers = final_k, nstart = 50)
+
+pharma$Cluster <- as.factor(kmeans_final$cluster)
+
+kmeans_final$size
+kmeans_final$centers
+```
+
+## Cluster Membership
+
+```{r cluster-membership}
+cluster_membership <- pharma[, c("Cluster", "Symbol", "Name", "Median_Recommendation", "Location", "Exchange")]
+cluster_membership <- cluster_membership[order(cluster_membership$Cluster, cluster_membership$Symbol), ]
+
+knitr::kable(cluster_membership)
+```
+
+## Interpret the Clusters Using Numerical Variables
+
+The table below shows the average values of the nine numerical variables for each cluster. These values are based on the original units, which makes the clusters easier to interpret.
+
+```{r cluster-means-original}
+cluster_means <- aggregate(pharma_numeric, by = list(Cluster = pharma$Cluster), mean)
+
+cluster_means_display <- cluster_means
+cluster_means_display[, numeric_vars] <- round(cluster_means_display[, numeric_vars], 2)
+
+knitr::kable(cluster_means_display)
+```
+
+The table below shows the cluster centers on the standardized scale. Positive values indicate that the cluster is above the dataset average for that variable, while negative values indicate that the cluster is below average.
+
+```{r cluster-centers-standardized}
+standardized_centers <- data.frame(
+  Cluster = as.factor(1:final_k),
+  round(kmeans_final$centers, 2)
+)
+
+knitr::kable(standardized_centers)
+```
+
+## Assign Descriptive Cluster Names
+
+To make the results easier to interpret, I assigned descriptive names based on the financial profile of each cluster. The cluster with the highest average market capitalization and strong profitability is labeled as large profitable established firms. The cluster with the highest beta and leverage is labeled as small high-risk growth firms. The remaining cluster is labeled as mid-sized valuation or transition firms.
+
+```{r cluster-names}
+cluster_summary <- aggregate(pharma_numeric, by = list(Cluster = pharma$Cluster), mean)
+
+large_profitable_cluster <- cluster_summary$Cluster[
+  which.max(scale(cluster_summary$Market_Cap)[,1] + scale(cluster_summary$Net_Profit_Margin)[,1] + scale(cluster_summary$ROA)[,1])
+]
+
+high_risk_cluster <- cluster_summary$Cluster[
+  which.max(scale(cluster_summary$Beta)[,1] + scale(cluster_summary$Leverage)[,1] + scale(cluster_summary$Rev_Growth)[,1])
+]
+
+cluster_summary$Cluster_Name <- "Mid-Sized Valuation / Transition Firms"
+cluster_summary$Cluster_Name[cluster_summary$Cluster == large_profitable_cluster] <- "Large Profitable Established Firms"
+cluster_summary$Cluster_Name[cluster_summary$Cluster == high_risk_cluster] <- "Small High-Risk Growth Firms"
+
+cluster_names <- cluster_summary[, c("Cluster", "Cluster_Name")]
+
+pharma <- merge(pharma, cluster_names, by = "Cluster", all.x = TRUE)
+
+knitr::kable(cluster_names)
+```
+
+## Cluster Interpretation
+
+```{r final-cluster-summary}
+final_cluster_summary <- aggregate(
+  pharma[, numeric_vars],
+  by = list(Cluster_Name = pharma$Cluster_Name),
+  mean
+)
+
+final_cluster_summary_display <- final_cluster_summary
+final_cluster_summary_display[, numeric_vars] <- round(final_cluster_summary_display[, numeric_vars], 2)
+
+knitr::kable(final_cluster_summary_display)
+```
+
+The large profitable established firms cluster is characterized by larger market capitalization and stronger profitability measures such as return on equity, return on assets, and net profit margin. These firms appear to represent the more established pharmaceutical companies in the dataset.
+
+The mid-sized valuation or transition firms cluster generally has lower profitability than the large profitable group and tends to show higher price/earnings ratios. This may suggest firms that investors value based on future expectations or firms that are in a less mature financial position compared with the strongest large-cap companies.
+
+The small high-risk growth firms cluster is characterized by smaller market capitalization, higher beta, higher leverage, and higher revenue growth. These firms appear to be more volatile and potentially more growth-oriented, but also riskier from a financial perspective.
+
+## Patterns in Variables Not Used in Clustering
+
+The variables not used in forming the clusters were Median_Recommendation, Location, and Exchange. These variables can help determine whether the financial clusters align with analyst sentiment, geography, or stock listing.
+
+```{r recommendation-patterns}
+recommendation_table <- table(pharma$Cluster_Name, pharma$Median_Recommendation)
+location_table <- table(pharma$Cluster_Name, pharma$Location)
+exchange_table <- table(pharma$Cluster_Name, pharma$Exchange)
+
+recommendation_table
+location_table
+exchange_table
+```
+
+The recommendation table shows whether analyst recommendations differ across the clusters. The location table shows whether firms from certain countries are concentrated in specific clusters. The exchange table shows whether the clusters align with where the firms are listed.
+
+In this dataset, the clearest non-financial pattern is related to exchange listing. The higher-risk smaller firms include the non-NYSE firms in the dataset, while the larger established companies are mostly listed on the NYSE. Location and recommendation appear more mixed, meaning the clusters are mainly driven by financial structure rather than geography or analyst recommendation alone.
+
+## Conclusion
+
+The k-means clustering analysis produced three interpretable groups of pharmaceutical firms. The data was standardized before clustering so that all numerical variables had equal weight in the distance calculations. The final model used k = 3 because it provided a useful balance between model simplicity and interpretability for a small dataset.
+
+The clusters can be summarized as large profitable established firms, mid-sized valuation or transition firms, and small high-risk growth firms. These groups differ mainly by market capitalization, profitability, leverage, beta, and revenue growth. The variables that were not used to form the clusters showed some additional patterns, especially exchange listing, but the main cluster structure was based on the numerical financial measures.
