@@ -1,0 +1,558 @@
+---
+title: 'MIS 64060 Final Exam: Fuel Receipt Segmentation and Cost Prediction'
+author: "Steve Lamber"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+  word_document:
+    toc: true
+  pdf_document:
+    toc: true
+    toc_depth: '3'
+---
+
+```{r setup, message=FALSE, warning=FALSE}
+# Reproducible seed required by the assignment.
+student_seed <- 5067
+set.seed(student_seed)
+
+# Install missing packages only when needed.
+required_packages <- c("arrow", "dplyr", "ggplot2", "lubridate", "cluster", "knitr", "scales")
+missing_packages <- required_packages[!sapply(required_packages, requireNamespace, quietly = TRUE)]
+if (length(missing_packages) > 0) {
+  install.packages(missing_packages, repos = "https://cloud.r-project.org")
+}
+
+library(arrow)
+library(dplyr)
+library(ggplot2)
+library(lubridate)
+library(cluster)
+library(knitr)
+library(scales)
+
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  fig.width = 8,
+  fig.height = 5
+)
+
+# Helpers
+rmse <- function(actual, predicted) {
+  sqrt(mean((actual - predicted)^2, na.rm = TRUE))
+}
+
+mae <- function(actual, predicted) {
+  mean(abs(actual - predicted), na.rm = TRUE)
+}
+
+top_value <- function(x) {
+  x <- x[!is.na(x)]
+  if (length(x) == 0) return(NA_character_)
+  names(sort(table(x), decreasing = TRUE))[1]
+}
+
+assign_kmeans_cluster <- function(newdata_scaled, centers) {
+  apply(newdata_scaled, 1, function(row) {
+    distances <- apply(centers, 1, function(center) sqrt(sum((row - center)^2)))
+    which.min(distances)
+  })
+}
+```
+
+# Executive Summary
+
+This analysis uses the PUDL monthly fuel receipts and costs table from EIA-923 Schedule 2, Part A to segment fuel delivery records for U.S. power plants. The goal is to help management understand how fuel purchasing patterns differ across the power generation market and whether those segments improve prediction of fuel cost per MMBtu. The primary method is k-means clustering, supported by a regression comparison for extra credit.
+
+The analysis uses a reproducible 2% random sample of the PUDL table with seed `r student_seed`, then splits the sample into 75% training and 25% test data. Variables with significant missingness are removed. The clustering model uses operational fuel receipt variables, while fuel cost is reserved for profiling the clusters and testing whether cluster membership improves cost prediction.
+
+# Introduction
+
+The Public Utility Data Liberation Project, or PUDL, turns public U.S. energy datasets into analysis-ready tables. For this project, I use the PUDL table `out_eia923__monthly_fuel_receipts_costs`, which contains monthly fuel deliveries to power plants aggregated by plant, fuel type, and reporting month.
+
+The original table includes plant identifiers, utility identifiers, state, fuel type, fuel receipt quantities, heat content, fuel cost, and several fuel quality variables. Some fuel quality fields have substantial missingness, so the first data-cleaning step removes variables with significant missing values. After cleaning, the analysis keeps the variables most useful for segmentation and cost prediction.
+
+# Problem Statement
+
+This project answers the following questions:
+
+1. What fuel purchasing segments appear in the PUDL EIA-923 fuel receipts and costs data?
+2. How should the number of clusters be selected?
+3. What do the clusters reveal about U.S. power generation fuel purchasing patterns?
+4. Do the clusters differ by fuel type, state, and fuel cost data source?
+5. Does adding cluster membership improve the prediction of `fuel_cost_per_mmbtu` on the test set?
+
+# Load and Prepare the Data
+
+```{r load-data}
+pudl_url <- "https://s3.us-west-2.amazonaws.com/pudl.catalyst.coop/nightly/out_eia923__monthly_fuel_receipts_costs.parquet"
+local_file <- "out_eia923__monthly_fuel_receipts_costs.parquet"
+
+if (!file.exists(local_file)) {
+  download.file(pudl_url, destfile = local_file, mode = "wb")
+}
+
+raw_data <- arrow::read_parquet(local_file) |> as.data.frame()
+
+dim(raw_data)
+head(raw_data)
+```
+
+## Missingness Review
+
+```{r missingness}
+missing_summary <- data.frame(
+  variable = names(raw_data),
+  missing_count = sapply(raw_data, function(x) sum(is.na(x))),
+  missing_percent = sapply(raw_data, function(x) mean(is.na(x)))
+) |>
+  arrange(desc(missing_percent))
+
+kable(missing_summary, digits = 3, caption = "Missing values by variable")
+```
+
+For this analysis, variables with more than 30% missing values are removed. This keeps the model focused on variables with enough coverage to support reliable segmentation.
+
+```{r remove-high-missing}
+missing_cutoff <- 0.30
+vars_removed <- missing_summary |>
+  filter(missing_percent > missing_cutoff) |>
+  pull(variable)
+
+vars_kept <- missing_summary |>
+  filter(missing_percent <= missing_cutoff) |>
+  pull(variable)
+
+clean_data <- raw_data[, vars_kept]
+
+vars_removed
+names(clean_data)
+```
+
+## Set Correct Variable Types
+
+```{r set-types}
+numeric_vars_required <- c(
+  "fuel_received_units",
+  "fuel_mmbtu_per_unit",
+  "fuel_cost_per_mmbtu",
+  "fuel_received_mmbtu",
+  "total_fuel_cost"
+)
+
+# Keep only required numeric variables that exist after the missingness screen.
+numeric_vars_available <- intersect(numeric_vars_required, names(clean_data))
+
+for (v in numeric_vars_available) {
+  clean_data[[v]] <- as.numeric(clean_data[[v]])
+}
+
+if ("report_date" %in% names(clean_data)) {
+  clean_data$report_date <- as.Date(clean_data$report_date)
+  clean_data$report_year <- lubridate::year(clean_data$report_date)
+}
+
+factor_candidates <- intersect(
+  c("state", "fuel_type_code_pudl", "fuel_cost_per_mmbtu_source", "data_maturity"),
+  names(clean_data)
+)
+
+for (v in factor_candidates) {
+  clean_data[[v]] <- as.factor(clean_data[[v]])
+}
+
+str(clean_data)
+```
+
+## Final Analysis Dataset
+
+```{r final-cleaning}
+analysis_vars <- c(
+  "report_date", "report_year", "plant_id_eia", "plant_name_eia", "utility_name_eia",
+  "state", "fuel_type_code_pudl", "fuel_cost_per_mmbtu_source",
+  "fuel_received_units", "fuel_mmbtu_per_unit", "fuel_cost_per_mmbtu",
+  "fuel_received_mmbtu", "total_fuel_cost"
+)
+
+analysis_vars <- intersect(analysis_vars, names(clean_data))
+
+analysis_data <- clean_data[, analysis_vars] |>
+  filter(
+    !is.na(fuel_received_units),
+    !is.na(fuel_mmbtu_per_unit),
+    !is.na(fuel_cost_per_mmbtu),
+    !is.na(fuel_received_mmbtu),
+    !is.na(total_fuel_cost),
+    fuel_received_units > 0,
+    fuel_received_mmbtu > 0,
+    total_fuel_cost >= 0,
+    fuel_cost_per_mmbtu >= 0
+  )
+
+if ("state" %in% names(analysis_data)) analysis_data <- analysis_data |> filter(!is.na(state))
+if ("fuel_type_code_pudl" %in% names(analysis_data)) analysis_data <- analysis_data |> filter(!is.na(fuel_type_code_pudl))
+if ("fuel_cost_per_mmbtu_source" %in% names(analysis_data)) analysis_data <- analysis_data |> filter(!is.na(fuel_cost_per_mmbtu_source))
+
+dim(analysis_data)
+```
+
+# Sample and Split the Data
+
+The assignment requires a random sample of about 2% of the data using a four-digit seed. I used seed `r student_seed`. The sampled data is then divided into a 75% training set and a 25% test set.
+
+```{r sample-split}
+set.seed(student_seed)
+sampled_data <- analysis_data |>
+  slice_sample(prop = 0.02)
+
+set.seed(student_seed)
+train_index <- sample(seq_len(nrow(sampled_data)), size = floor(0.75 * nrow(sampled_data)))
+train_data <- sampled_data[train_index, ]
+test_data <- sampled_data[-train_index, ]
+
+nrow(sampled_data)
+nrow(train_data)
+nrow(test_data)
+```
+
+# Exploratory Analysis
+
+```{r fuel-type-counts}
+train_data |>
+  count(fuel_type_code_pudl, sort = TRUE) |>
+  kable(caption = "Training sample records by fuel type")
+```
+
+```{r fuel-type-plot}
+train_data |>
+  count(fuel_type_code_pudl, sort = TRUE) |>
+  ggplot(aes(x = reorder(fuel_type_code_pudl, n), y = n)) +
+  geom_col() +
+  coord_flip() +
+  labs(
+    title = "Fuel Types in the Training Sample",
+    x = "Fuel type",
+    y = "Number of records"
+  )
+```
+
+```{r cost-distribution}
+ggplot(train_data, aes(x = fuel_cost_per_mmbtu)) +
+  geom_histogram(bins = 50) +
+  labs(
+    title = "Distribution of Fuel Cost per MMBtu",
+    x = "Fuel cost per MMBtu",
+    y = "Number of records"
+  )
+```
+
+# K-Means Clustering
+
+For clustering, I use operational fuel receipt variables and reserve `fuel_cost_per_mmbtu` as an outcome variable for profiling and regression. This avoids using the target cost variable to create clusters that are later used to predict cost.
+
+The clustering variables are:
+
+- `log_fuel_received_units`
+- `fuel_mmbtu_per_unit`
+- `log_fuel_received_mmbtu`
+
+These variables are transformed and normalized because k-means is distance-based and can be dominated by variables with larger scales.
+
+```{r clustering-data}
+make_cluster_features <- function(df) {
+  data.frame(
+    log_fuel_received_units = log1p(df$fuel_received_units),
+    fuel_mmbtu_per_unit = df$fuel_mmbtu_per_unit,
+    log_fuel_received_mmbtu = log1p(df$fuel_received_mmbtu)
+  )
+}
+
+train_cluster_x <- make_cluster_features(train_data)
+test_cluster_x <- make_cluster_features(test_data)
+
+# Drop any zero-variance feature if it appears in a specific sample.
+zero_variance <- sapply(train_cluster_x, sd, na.rm = TRUE) == 0
+train_cluster_x <- train_cluster_x[, !zero_variance, drop = FALSE]
+test_cluster_x <- test_cluster_x[, names(train_cluster_x), drop = FALSE]
+
+train_scaled <- scale(train_cluster_x)
+scale_center <- attr(train_scaled, "scaled:center")
+scale_scale <- attr(train_scaled, "scaled:scale")
+test_scaled <- scale(test_cluster_x, center = scale_center, scale = scale_scale)
+```
+
+## Choosing the Number of Clusters
+
+I evaluate values of k from 2 through 8. The elbow method looks at total within-cluster sum of squares, while the silhouette method checks how well-separated the cluster assignments are.
+
+```{r choose-k}
+set.seed(student_seed)
+k_grid <- 2:8
+
+wss <- sapply(k_grid, function(k) {
+  kmeans(train_scaled, centers = k, nstart = 25, iter.max = 100)$tot.withinss
+})
+
+# Silhouette is computed on a manageable subsample to avoid a large distance matrix.
+set.seed(student_seed)
+sil_n <- min(2000, nrow(train_scaled))
+sil_idx <- sample(seq_len(nrow(train_scaled)), size = sil_n)
+sil_data <- train_scaled[sil_idx, , drop = FALSE]
+sil_dist <- dist(sil_data)
+
+silhouette_scores <- sapply(k_grid, function(k) {
+  km <- kmeans(sil_data, centers = k, nstart = 25, iter.max = 100)
+  mean(cluster::silhouette(km$cluster, sil_dist)[, 3])
+})
+
+k_results <- data.frame(
+  k = k_grid,
+  within_cluster_sum_squares = wss,
+  average_silhouette = silhouette_scores
+)
+
+kable(k_results, digits = 4, caption = "Cluster tuning results")
+```
+
+```{r elbow-plot}
+ggplot(k_results, aes(x = k, y = within_cluster_sum_squares)) +
+  geom_line() +
+  geom_point() +
+  scale_x_continuous(breaks = k_grid) +
+  labs(
+    title = "Elbow Plot for K-Means",
+    x = "Number of clusters",
+    y = "Total within-cluster sum of squares"
+  )
+```
+
+```{r silhouette-plot}
+ggplot(k_results, aes(x = k, y = average_silhouette)) +
+  geom_line() +
+  geom_point() +
+  scale_x_continuous(breaks = k_grid) +
+  labs(
+    title = "Average Silhouette by Number of Clusters",
+    x = "Number of clusters",
+    y = "Average silhouette width"
+  )
+```
+
+For the final segmentation I use four clusters. This choice balances the elbow and silhouette diagnostics with interpretability for management. A smaller k would hide useful differences in receipt scale and heat content, while a larger k would create more segments than needed for a high-level management presentation.
+
+```{r final-kmeans}
+chosen_k <- 4
+set.seed(student_seed)
+km_final <- kmeans(train_scaled, centers = chosen_k, nstart = 50, iter.max = 100)
+
+train_data$cluster <- factor(km_final$cluster)
+test_data$cluster <- factor(
+  assign_kmeans_cluster(test_scaled, km_final$centers),
+  levels = levels(train_data$cluster)
+)
+
+km_final$centers
+```
+
+## Visualize Clusters with PCA
+
+```{r pca-cluster-plot}
+pca <- prcomp(train_scaled)
+pca_df <- data.frame(
+  PC1 = pca$x[, 1],
+  PC2 = pca$x[, 2],
+  cluster = train_data$cluster,
+  fuel_type = train_data$fuel_type_code_pudl
+)
+
+ggplot(pca_df, aes(x = PC1, y = PC2, color = cluster)) +
+  geom_point(alpha = 0.55, size = 1.4) +
+  labs(
+    title = "K-Means Clusters Projected onto First Two Principal Components",
+    x = "Principal component 1",
+    y = "Principal component 2",
+    color = "Cluster"
+  )
+```
+
+# Cluster Profiles
+
+```{r cluster-profiles}
+cluster_profile <- train_data |>
+  group_by(cluster) |>
+  summarise(
+    records = n(),
+    percent_of_training = records / nrow(train_data),
+    median_fuel_cost_per_mmbtu = median(fuel_cost_per_mmbtu, na.rm = TRUE),
+    mean_fuel_cost_per_mmbtu = mean(fuel_cost_per_mmbtu, na.rm = TRUE),
+    median_fuel_received_units = median(fuel_received_units, na.rm = TRUE),
+    median_fuel_received_mmbtu = median(fuel_received_mmbtu, na.rm = TRUE),
+    median_mmbtu_per_unit = median(fuel_mmbtu_per_unit, na.rm = TRUE),
+    median_total_fuel_cost = median(total_fuel_cost, na.rm = TRUE),
+    top_fuel_type = top_value(fuel_type_code_pudl),
+    top_state = top_value(state),
+    top_cost_source = top_value(fuel_cost_per_mmbtu_source),
+    .groups = "drop"
+  )
+
+cluster_profile_display <- cluster_profile |>
+  mutate(percent_of_training = percent(percent_of_training, accuracy = 0.1))
+
+kable(cluster_profile_display, digits = 2, caption = "Cluster profile summary")
+```
+
+## Assign Management-Friendly Cluster Names
+
+```{r cluster-names}
+cluster_names <- cluster_profile |>
+  mutate(cluster_name = "Moderate-volume mixed fuel receipts")
+
+high_cost_cluster <- cluster_names$cluster[which.max(cluster_names$median_fuel_cost_per_mmbtu)]
+high_volume_cluster <- cluster_names$cluster[which.max(cluster_names$median_fuel_received_mmbtu)]
+low_cost_cluster <- cluster_names$cluster[which.min(cluster_names$median_fuel_cost_per_mmbtu)]
+high_heat_cluster <- cluster_names$cluster[which.max(cluster_names$median_mmbtu_per_unit)]
+
+cluster_names$cluster_name[cluster_names$cluster == high_volume_cluster] <- "Large-volume thermal fuel receipts"
+cluster_names$cluster_name[cluster_names$cluster == high_cost_cluster] <- "High-cost specialty or peaking fuel receipts"
+cluster_names$cluster_name[cluster_names$cluster == low_cost_cluster] <- "Low-cost routine fuel receipts"
+cluster_names$cluster_name[cluster_names$cluster == high_heat_cluster & cluster_names$cluster_name == "Moderate-volume mixed fuel receipts"] <- "High-heat-content fuel receipts"
+
+name_map <- setNames(cluster_names$cluster_name, cluster_names$cluster)
+train_data$cluster_name <- factor(name_map[as.character(train_data$cluster)])
+test_data$cluster_name <- factor(name_map[as.character(test_data$cluster)], levels = levels(train_data$cluster_name))
+
+kable(cluster_names, digits = 2, caption = "Assigned cluster names")
+```
+
+## Pattern Checks by Fuel Type, State, and Cost Source
+
+```{r cluster-fuel-patterns}
+fuel_patterns <- train_data |>
+  count(cluster_name, fuel_type_code_pudl, sort = TRUE) |>
+  group_by(cluster_name) |>
+  mutate(percent_within_cluster = n / sum(n)) |>
+  slice_max(order_by = percent_within_cluster, n = 5) |>
+  ungroup()
+
+kable(fuel_patterns, digits = 3, caption = "Top fuel types within each cluster")
+```
+
+```{r cluster-state-patterns}
+state_patterns <- train_data |>
+  count(cluster_name, state, sort = TRUE) |>
+  group_by(cluster_name) |>
+  mutate(percent_within_cluster = n / sum(n)) |>
+  slice_max(order_by = percent_within_cluster, n = 5) |>
+  ungroup()
+
+kable(state_patterns, digits = 3, caption = "Top states within each cluster")
+```
+
+```{r cluster-source-patterns}
+source_patterns <- train_data |>
+  count(cluster_name, fuel_cost_per_mmbtu_source, sort = TRUE) |>
+  group_by(cluster_name) |>
+  mutate(percent_within_cluster = n / sum(n)) |>
+  ungroup()
+
+kable(source_patterns, digits = 3, caption = "Fuel cost data source by cluster")
+```
+
+# Extra Credit: Regression to Predict Fuel Cost per MMBtu
+
+The regression task predicts `fuel_cost_per_mmbtu` on the test set. The base model uses the operational variables that were available before cost was observed. The second model adds cluster membership to test whether segmentation improves prediction.
+
+```{r regression-prep}
+train_model <- train_data |>
+  mutate(
+    log_fuel_received_units = log1p(fuel_received_units),
+    log_fuel_received_mmbtu = log1p(fuel_received_mmbtu)
+  )
+
+test_model <- test_data |>
+  mutate(
+    log_fuel_received_units = log1p(fuel_received_units),
+    log_fuel_received_mmbtu = log1p(fuel_received_mmbtu)
+  )
+
+base_model <- lm(
+  fuel_cost_per_mmbtu ~ log_fuel_received_units + fuel_mmbtu_per_unit + log_fuel_received_mmbtu,
+  data = train_model
+)
+
+cluster_model <- lm(
+  fuel_cost_per_mmbtu ~ log_fuel_received_units + fuel_mmbtu_per_unit + log_fuel_received_mmbtu + cluster_name,
+  data = train_model
+)
+
+base_pred <- predict(base_model, newdata = test_model)
+cluster_pred <- predict(cluster_model, newdata = test_model)
+
+model_comparison <- data.frame(
+  model = c("Base regression", "Regression with cluster membership"),
+  RMSE = c(rmse(test_model$fuel_cost_per_mmbtu, base_pred), rmse(test_model$fuel_cost_per_mmbtu, cluster_pred)),
+  MAE = c(mae(test_model$fuel_cost_per_mmbtu, base_pred), mae(test_model$fuel_cost_per_mmbtu, cluster_pred))
+)
+
+kable(model_comparison, digits = 4, caption = "Test-set prediction performance")
+```
+
+```{r regression-summary}
+summary(base_model)
+summary(cluster_model)
+```
+
+```{r regression-plot}
+plot_df <- data.frame(
+  actual = test_model$fuel_cost_per_mmbtu,
+  predicted_base = base_pred,
+  predicted_cluster = cluster_pred
+)
+
+ggplot(plot_df, aes(x = actual, y = predicted_cluster)) +
+  geom_point(alpha = 0.45, size = 1.3) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed") +
+  labs(
+    title = "Actual vs. Predicted Fuel Cost per MMBtu",
+    subtitle = "Regression model with cluster membership",
+    x = "Actual fuel cost per MMBtu",
+    y = "Predicted fuel cost per MMBtu"
+  )
+```
+
+# Analysis and Discussion
+
+The clustering model segments power plant fuel receipts based on the scale and heat content of fuel deliveries. This is useful because power generation fuel purchasing is not one market. Large-volume fuel receipts, routine lower-cost fuel receipts, high-heat-content deliveries, and high-cost specialty or peaking fuel receipts behave differently. Treating them as one group can hide meaningful differences in procurement risk and cost exposure.
+
+The cluster profiles above show how the segments differ by fuel type, state, fuel cost data source, delivered energy, and cost per MMBtu. These differences can help management understand which fuel categories drive cost exposure and which segments appear more standardized. The fuel type and state tables are especially important because they connect the statistical clusters back to business and operating context.
+
+For the regression portion, the comparison table shows whether adding cluster membership improves test-set prediction of `fuel_cost_per_mmbtu`. If the RMSE and MAE decrease after adding cluster membership, that suggests the segmentation captures useful structure that the base numeric variables do not fully capture.
+
+# Conclusions
+
+This project uses k-means clustering to provide a management-friendly segmentation of U.S. power plant fuel receipts. The segmentation helps explain differences in fuel procurement scale, heat content, and cost exposure. It also provides a useful input for cost prediction when cluster membership improves test-set performance.
+
+Key assumptions include:
+
+- The 2% sample is representative enough for exploratory segmentation.
+- Variables with more than 30% missingness should be removed rather than heavily imputed.
+- K-means is appropriate after numeric transformation and standardization.
+- Four clusters provide a practical balance between detail and interpretability.
+
+Important limitations include:
+
+- PUDL notes that some values are estimated or redacted.
+- Fuel delivery timing is not always the same as fuel consumption timing.
+- The analysis uses monthly receipt records, not direct plant dispatch or generation decisions.
+- A different random seed or future PUDL release could slightly change the exact cluster profiles.
+
+# References
+
+Catalyst Cooperative. (2026). PUDL Data Viewer: `out_eia923__monthly_fuel_receipts_costs`. https://data.catalyst.coop/preview/pudl/out_eia923__monthly_fuel_receipts_costs
+
+Kent State University. (2026). MIS 64060 Final Exam Instructions.
